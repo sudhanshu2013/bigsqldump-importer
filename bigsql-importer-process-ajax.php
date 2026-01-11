@@ -5,54 +5,75 @@ session_start();
   *******************************************************************************************
   * BigSQL Importer - AJAX Backend Processor                                                *
   * *
+  * Script/Code Author: Mr. Shudhanshu Kumar Pandey                                         *
   * @license MIT                                                                            *
-  * @author Shudhanshu Kumar Pandey                                                         *
   * @year 2026                                                                              *
   * *
   * Description:                                                                            *
-  * Handles the staggered import of SQL files via AJAX.                                     *
-  * Implements Try/Catch blocks for fault tolerance.                                        *
-  * Tracks processing context (Table Name) for better error logging.                        *
-  * Returns detailed statistics upon completion.                                            *
+  * Core logic for processing SQL dumps in chunks to avoid timeouts.                         *
+  * Includes robust "Atomic Breaking" to prevent syntax errors on split queries.            *
+  * Implements 'Continue on Error' logic to ensure all valid data is inserted.              *
   *******************************************************************************************
 */
 
+// Set Response Header
 header('Content-Type: application/json');
 
-// 1. CONFIGURATION
-// -------------------------------------------------------------------
-// IMPORTANT: Limit lines per session to ensure frequent AJAX responses.
-// This allows the frontend progress bar to update "live".
-// A value of 3000-5000 is usually optimal for shared hosting.
+// ======================================================================
+// 1. CONFIGURATION & TUNING
+// ======================================================================
+
+// BATCH SIZE LIMIT
+// We aim for ~3000 lines per request to keep the UI responsive.
+// NOTE: The script will now intelligently exceed this limit if required 
+// to finish a specific query, preventing the "Syntax Error" logs you saw.
 $cfg_lines_per_session = 3000; 
+
+// EXECUTION TIME LIMIT
+// Safety cutoff to prevent HTTP 504 Gateway Timeouts.
+// Standard PHP timeout is usually 30s, so we stop safely at 25s.
+$max_exec_time = 25; 
+
 $upload_dir = dirname(__FILE__) . '/';
 
-// 2. AUTHENTICATION CHECK
-// -------------------------------------------------------------------
+// ======================================================================
+// 2. SECURITY & AUTHENTICATION
+// ======================================================================
+
 if (!isset($_SESSION['rh_auth']) || !isset($_POST['ajax_process'])) {
     echo json_encode(['status' => 'error', 'message' => 'Unauthorized Access']);
     exit;
 }
 
-// 3. INITIALIZATION
-// -------------------------------------------------------------------
+// ======================================================================
+// 3. INITIALIZATION & RESTORATION
+// ======================================================================
+
+// Retrieve state variables passed from Frontend
 $filename      = $_POST['filename'];
 $start_line    = (int)$_POST['start_line'];
 $file_offset   = (int)$_POST['file_offset'];
 $total_queries = (int)$_POST['total_queries'];
 $total_errors  = (int)$_POST['total_errors'];
 $filepath      = $upload_dir . $filename;
+
+// Log File: Use session-based log or fallback
 $log_file      = $upload_dir . (isset($_SESSION['rh_log_file']) ? $_SESSION['rh_log_file'] : 'import_error_log.txt');
 
-// Helper function to write to text log
+/**
+ * Helper: Write to Log File
+ * Appends messages to the server-side text log for debugging.
+ */
 function write_log($file, $msg) {
     $date = date('Y-m-d H:i:s');
     file_put_contents($file, "[$date] $msg" . PHP_EOL, FILE_APPEND);
 }
 
+// ======================================================================
 // 4. DATABASE CONNECTION
-// -------------------------------------------------------------------
-// Enable Strict Reporting to catch Exceptions
+// ======================================================================
+
+// Enable Strict Reporting to catch all SQL errors as Exceptions
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
 try {
@@ -68,18 +89,22 @@ try {
     exit;
 }
 
-// 5. FILE HANDLING (GZIP & STANDARD)
-// -------------------------------------------------------------------
+// ======================================================================
+// 5. FILE POINTER HANDLING
+// ======================================================================
+
+// Detect File Type
 $is_gzip = preg_match("/\.gz$/i", $filename);
 $file_handle = false;
 
+// Open File
 if ($is_gzip) {
     $file_handle = @gzopen($filepath, "r");
     if (!$file_handle) {
         echo json_encode(['status' => 'error', 'message' => 'Could not open GZIP file.']);
         exit;
     }
-    // Seek GZIP (Note: gzseek is slow on large offsets, but necessary for staggering)
+    // Resume Position (Seek)
     if ($file_offset > 0) gzseek($file_handle, $file_offset);
 } else {
     $file_handle = @fopen($filepath, "r");
@@ -87,60 +112,78 @@ if ($is_gzip) {
         echo json_encode(['status' => 'error', 'message' => 'Could not open SQL file.']);
         exit;
     }
+    // Resume Position (Seek)
     if ($file_offset > 0) fseek($file_handle, $file_offset);
 }
 
-// Calculate/Estimate Filesize for Progress
+// Get File Size for Progress Bar
 $filesize = 0;
 if (!$is_gzip) {
     $filesize = filesize($filepath);
-} else {
-    // For GZIP, we can't get uncompressed size easily. We'll rely on pointer position or 0.
-    $filesize = 0; 
 }
 
-// 6. PROCESSING LOOP
-// -------------------------------------------------------------------
+// ======================================================================
+// 6. CORE PROCESSING LOOP (ATOMIC EXECUTION)
+// ======================================================================
+
 $current_line_num = $start_line;
-$query_buffer = "";
-$delimiter = ";";
+$query_buffer = "";      // Stores the accumulating SQL query
+$delimiter = ";";        // Default delimiter
 $lines_processed_count = 0;
-$batch_logs = []; // Logs sent back to browser console
-$status = 'continue';
-
-// Tracking Variables for improved logging
-$current_table_context = "Unknown"; 
-
-// We run until we hit the line limit OR a time limit (soft check)
+$batch_logs = [];        // Logs to send back to Browser
+$status = 'finished';    // Default assumption, changed to 'continue' if loop breaks early
 $start_time = time();
-$max_exec_time = 25; // Safe margin for standard 30s timeout
+$current_table_context = "Unknown"; // For Error Logging
 
-while ($lines_processed_count < $cfg_lines_per_session) {
+/**
+ * MAIN LOOP
+ * Reads the file line-by-line.
+ * CRITICAL FIX: The loop condition is `true`. We explicitly `break` only when appropriate.
+ */
+while (true) {
     
-    // Check timeout protection
-    if ((time() - $start_time) > $max_exec_time) {
-        break; // Stop and let AJAX reload to reset timer
+    // ------------------------------------------------------------------
+    // A. BREAK CONDITION CHECK (Atomic Safety)
+    // ------------------------------------------------------------------
+    // We ONLY check the limits if the $query_buffer is EMPTY.
+    // This ensures we never split a query in the middle.
+    if (trim($query_buffer) === "") {
+        // Check if we exceeded line limit OR time limit
+        if ($lines_processed_count >= $cfg_lines_per_session || (time() - $start_time) > $max_exec_time) {
+            $status = 'continue'; // Tell frontend to request next batch
+            break; // Pause here
+        }
     }
 
-    // Read Line
+    // ------------------------------------------------------------------
+    // B. READ NEXT LINE
+    // ------------------------------------------------------------------
+    $line = false;
     if ($is_gzip) {
-        if (gzeof($file_handle)) break;
-        $line = gzgets($file_handle, 40960); // Read 40KB chunk
+        if (gzeof($file_handle)) break; // End of File
+        $line = gzgets($file_handle, 40960); // Read ~40KB chunk
     } else {
-        if (feof($file_handle)) break;
+        if (feof($file_handle)) break; // End of File
         $line = fgets($file_handle, 40960);
     }
 
-    if ($line === false) break;
+    // If reading failed or EOF reached naturally
+    if ($line === false) {
+        break;
+    }
 
-    // Remove BOM (Byte Order Mark) on very first line
+    // Handle BOM (Byte Order Mark) on the absolute first line
     if ($file_offset == 0 && $current_line_num == 0) {
         $line = preg_replace('/^\xEF\xBB\xBF/', '', $line);
     }
 
     $trimmed_line = trim($line);
 
-    // LOGIC: Handle DELIMITER switching (e.g. Procedures/Functions)
+    // ------------------------------------------------------------------
+    // C. PARSING LOGIC
+    // ------------------------------------------------------------------
+
+    // 1. Handle DELIMITER changes (e.g., for Stored Procedures)
     if (preg_match('/^DELIMITER\s+(.*)$/i', $trimmed_line, $matches)) {
         $delimiter = $matches[1];
         $current_line_num++;
@@ -148,72 +191,78 @@ while ($lines_processed_count < $cfg_lines_per_session) {
         continue;
     }
 
-    // LOGIC: Skip Standard Comments (-- or #)
-    // Only if they start the line.
-    if (strpos($trimmed_line, '--') === 0 || strpos($trimmed_line, '#') === 0) {
+    // 2. Skip Comments (Optimize speed)
+    // Only if line STARTS with comment and we aren't inside a query string
+    if (trim($query_buffer) === "" && (strpos($trimmed_line, '--') === 0 || strpos($trimmed_line, '#') === 0 || strpos($trimmed_line, '/*') === 0)) {
         $current_line_num++;
         $lines_processed_count++;
         continue;
     }
 
-    // LOGIC: Detect Table Name Context
-    // We try to parse "INSERT INTO `tablename`" or "CREATE TABLE `tablename`"
-    if (preg_match('/^\s*(INSERT\s+INTO|CREATE\s+TABLE)\s+[`"]?([a-zA-Z0-9_]+)[`"]?/i', $trimmed_line, $matches)) {
+    // 3. Detect Table Name (For Logging purposes)
+    // We look for INSERT INTO or CREATE TABLE statements at the start of a buffer
+    if (trim($query_buffer) === "" && preg_match('/^\s*(INSERT\s+INTO|CREATE\s+TABLE)\s+[`"]?([a-zA-Z0-9_]+)[`"]?/i', $trimmed_line, $matches)) {
         $current_table_context = $matches[2];
     }
 
-    // Append line to buffer
+    // 4. Append Line to Buffer
     $query_buffer .= $line;
 
-    // CHECK IF QUERY IS COMPLETE
-    // We check if the trimmed line ends with the current delimiter
+    // ------------------------------------------------------------------
+    // D. EXECUTION TRIGGER
+    // ------------------------------------------------------------------
+    
+    // Check if the trimmed line ends with the current delimiter.
+    // NOTE: This handles both single-line queries and multi-line extended inserts.
     if (substr($trimmed_line, -strlen($delimiter)) === $delimiter) {
         
-        // Remove delimiter from the end to execute
+        // Strip the delimiter to prepare SQL for execution
         $sql_to_run = substr(trim($query_buffer), 0, -strlen($delimiter));
 
         if (!empty($sql_to_run)) {
             try {
+                // EXECUTE QUERY
                 $mysqli->query($sql_to_run);
                 $total_queries++;
             } catch (mysqli_sql_exception $e) {
                 // ******************************************************
-                // FAULT TOLERANCE & DETAILED LOGGING
+                // FAULT TOLERANCE: IGNORE ERROR & CONTINUE
                 // ******************************************************
+                // As requested: "Insert in tables anyhow [dont skip any]"
+                // We catch the error, log it, but DO NOT stop the script.
                 
                 $err_msg = $e->getMessage();
                 $err_code = $e->getCode();
                 
-                // Construct detailed error message
+                // Detailed Log for Server File
                 $log_detail = "Table: $current_table_context | Line: $current_line_num | Error ($err_code): $err_msg";
-                
-                // Log detailed error to text file
                 write_log($log_file, $log_detail);
                 
-                // Add skipped info to text file
+                // Save a snippet of the failed query for debugging
                 write_log($log_file, "Query Snippet: " . substr($sql_to_run, 0, 150) . "...");
                 write_log($log_file, "--------------------------------------------------");
 
-                // Update counters
                 $total_errors++;
                 
-                // Add to Browser Console Log (short version)
-                $batch_logs[] = "Error in [$current_table_context]: " . substr($err_msg, 0, 50) . "...";
+                // Send short error to Browser Console
+                $batch_logs[] = "Error in [$current_table_context]: " . substr($err_msg, 0, 60) . "...";
             }
         }
 
-        // Reset Buffer
+        // RESET BUFFER (Ready for next query)
         $query_buffer = "";
+        $current_table_context = "Unknown"; // Reset context
     }
 
     $current_line_num++;
     $lines_processed_count++;
 }
 
-// 7. FINALIZE BATCH
-// -------------------------------------------------------------------
+// ======================================================================
+// 7. FINALIZE BATCH STATE
+// ======================================================================
 
-// Get new offset
+// Save File Position
 if ($is_gzip) {
     $new_offset = gztell($file_handle);
     gzclose($file_handle);
@@ -222,44 +271,49 @@ if ($is_gzip) {
     fclose($file_handle);
 }
 
-// Calculate Progress Percentage
+// Calculate Percentage
 $pct = 0;
 if ($filesize > 0) {
     $pct = round(($new_offset / $filesize) * 100, 2);
 } else {
-    $pct = 99; // Fallback for Gzip
+    // Fallback for Gzip (unknown size)
+    $pct = 99; 
 }
 if ($pct > 100) $pct = 100;
 
-// Determine if Finished
-// If we read less than limit AND query buffer is empty, we are likely done.
-if ($lines_processed_count < $cfg_lines_per_session && empty(trim($query_buffer))) {
+// Final Completion Check
+// If buffer is empty AND we broke the loop because of EOF (not limit), we are done.
+if ($status !== 'continue' && empty(trim($query_buffer))) {
     $status = 'finished';
     $pct = 100;
 }
 
-// 8. GATHER STATISTICS (IF FINISHED)
-// -------------------------------------------------------------------
+// ======================================================================
+// 8. POST-IMPORT STATISTICS (Only on Finish)
+// ======================================================================
 $table_stats = [];
 if ($status === 'finished') {
     try {
         $result = $mysqli->query("SHOW TABLE STATUS");
-        while ($row = $result->fetch_assoc()) {
-            $size_mb = round(($row['Data_length'] + $row['Index_length']) / 1024 / 1024, 2);
-            $table_stats[] = [
-                'Name' => $row['Name'],
-                'Rows' => number_format($row['Rows']),
-                'SizeMB' => $size_mb
-            ];
+        if ($result) {
+            while ($row = $result->fetch_assoc()) {
+                // Calculate size in MB
+                $size_mb = round(($row['Data_length'] + $row['Index_length']) / 1024 / 1024, 2);
+                $table_stats[] = [
+                    'Name' => $row['Name'],
+                    'Rows' => number_format($row['Rows']),
+                    'SizeMB' => $size_mb
+                ];
+            }
         }
     } catch (Exception $e) {
-        // Fail silently on stats collection if something goes wrong, not critical
         write_log($log_file, "Warning: Could not fetch final table stats.");
     }
 }
 
-// 9. SEND JSON RESPONSE
-// -------------------------------------------------------------------
+// ======================================================================
+// 9. RETURN JSON RESPONSE
+// ======================================================================
 echo json_encode([
     'status' => $status,
     'current_line' => $current_line_num,
@@ -269,7 +323,7 @@ echo json_encode([
     'pct_complete' => $pct,
     'batch_log' => $batch_logs,
     'log_file' => basename($log_file),
-    'table_stats' => $table_stats // Send final stats if finished
+    'table_stats' => $table_stats
 ]);
 exit;
 ?>
